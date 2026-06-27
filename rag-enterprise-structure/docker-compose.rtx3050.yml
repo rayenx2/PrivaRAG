@@ -1,0 +1,30 @@
+# RTX 3050 6GB VRAM — Optimized Overlay
+# Usage: docker compose -f docker-compose.yml -f docker-compose.nvidia.yml -f docker-compose.rtx3050.yml up -d
+
+services:
+  backend:
+    environment:
+      LLM_MODEL: "phi3:3.8b-mini-4k-instruct-q4_K_M"
+      EMBEDDING_MODEL: "BAAI/bge-m3"
+      RELEVANCE_THRESHOLD: "0.35"
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:128"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  ollama:
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE: "5m"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
