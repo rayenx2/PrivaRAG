@@ -1,0 +1,1347 @@
+"""
+RAG Enterprise Backend - FastAPI Application
+Manages: OCR, Embedding, RAG Pipeline, Qdrant Integration
+"""
+
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, BackgroundTasks, Depends
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+import os
+import logging
+from datetime import datetime
+import traceback
+import gc
+import torch
+
+from rag_pipeline import RAGPipeline, wait_for_ollama, ensure_model
+from ocr_service import OCRService
+from embeddings_service import EmbeddingsService
+from qdrant_connector import QdrantConnector
+import re
+from typing import Dict, Optional
+
+# Authentication imports
+from auth import create_user_token
+from database import db, UserRole
+from auth_models import (
+    LoginRequest, LoginResponse, UserInfo, UserCreate, UserUpdate,
+    PasswordChange, UserListResponse, MessageResponse
+)
+from middleware import (
+    get_current_user, require_admin, require_upload_permission,
+    require_delete_permission, CurrentUser
+)
+
+# Backup imports
+from backup_service import backup_service
+from backup_scheduler import BackupScheduler
+from backup_models import (
+    BackupProviderCreate, BackupRunRequest, BackupScheduleRequest,
+    BackupRestoreRequest
+)
+
+def detect_document_type(text: str) -> str:
+    """Detects document type - with stricter checks"""
+    text_upper = text.upper()
+
+    # Order: more specific → less specific
+
+    # 1. IDENTITY CARD (very specific)
+    if 'CARTA DI IDENTITA' in text_upper or 'IDENTITY CARD' in text_upper:
+        if 'REPUBBLICA ITALIANA' in text_upper:  # Extra check
+            return 'IDENTITY_CARD'
+    
+    # 2. PASSPORT (very specific)
+    if 'PASSAPORTO' in text_upper or 'PASSPORT' in text_upper:
+        if 'REPUBBLICA ITALIANA' in text_upper:
+            return 'PASSPORT'
+
+    # 3. DRIVING LICENSE (very specific)
+    if 'PATENTE DI GUIDA' in text_upper or 'DRIVING LICENSE' in text_upper:
+        return 'DRIVING_LICENSE'
+
+    # 4. CONTRACT
+    if 'CONTRATTO' in text_upper or 'CONTRACT' in text_upper or 'AGREEMENT' in text_upper:
+        return 'CONTRACT'
+    
+    # DEFAULT
+    return 'GENERIC_DOCUMENT'
+
+
+def extract_id_fields(text: str) -> Dict[str, Optional[str]]:
+    """Extracts fields from Identity Card - vertical layout"""
+    fields = {}
+    
+    # Tax Code (Codice Fiscale): after "CODICE FISCALE" or "FISCAL CODE", on the next line
+    # Pattern: exactly 16 characters (6 letters + 2 digits + 1 letter + 2 digits + 1 letter + 3 digits + 1 letter)
+    cf_pattern = r'(?:CODICE\s+FISCALE|FISCAL\s+CODE)\s*\n\s*([A-Z]{6}\d{2}[A-Z]\d{2}[A-Z]\d{3}[A-Z])'
+    cf_match = re.search(cf_pattern, text, re.IGNORECASE | re.MULTILINE)
+    
+    if cf_match:
+        fields['codice_fiscale'] = cf_match.group(1)
+    
+    # Address
+    addr_pattern = r'(VIA|VIALE|PIAZZA|CORSO|STRADA)\s+([A-Z\s,\'-]+?),\s+N\.\s+(\d+)\s+([A-Z\s\(\)]+)'
+    addr_match = re.search(addr_pattern, text)
+    if addr_match:
+        fields['address'] = f"{addr_match.group(1)} {addr_match.group(2)}, N. {addr_match.group(3)} {addr_match.group(4)}"
+
+    # Birth date (search after "LUOGO E DATA DI NASCITA" / "PLACE AND DATE OF BIRTH")
+    date_pattern = r'(?:LUOGO\s+E\s+DATA|PLACE\s+AND\s+DATE)[^\n]*\n\s*([A-Z\s]+)\s+(\d{1,2})[./](\d{1,2})[./](\d{4})'
+    date_match = re.search(date_pattern, text, re.IGNORECASE | re.MULTILINE)
+    if date_match:
+        fields['birth_date'] = f"{date_match.group(2)}.{date_match.group(3)}.{date_match.group(4)}"
+        fields['birth_place'] = date_match.group(1).strip()
+    
+    return fields
+
+
+def extract_passport_fields(text: str) -> Dict[str, Optional[str]]:
+    """Extracts fields from Passport"""
+    fields = {}
+    
+    # Passport number (usually 9 characters)
+    passport_pattern = r'[A-Z]{2}\d{7}'
+    passport_match = re.search(passport_pattern, text)
+    if passport_match:
+        fields['passport_number'] = passport_match.group()
+    
+    return fields
+
+
+def extract_license_fields(text: str) -> Dict[str, Optional[str]]:
+    """Extracts fields from Driving License - WITH strict checks"""
+    fields = {}
+
+    # Check 1: must contain "PATENTE DI GUIDA"
+    if 'PATENTE DI GUIDA' not in text.upper() and 'DRIVING LICENSE' not in text.upper():
+        return fields
+
+    # Check 2: Italian license number pattern (10 alphanumeric characters)
+    # But ONLY if preceded by specific keywords
+    license_pattern = r'(?:Numero|Number|N\.|Nr\.)\s*[:\s]*([A-Z0-9]{10})'
+    license_match = re.search(license_pattern, text)
+    if license_match:
+        fields['license_number'] = license_match.group(1)
+    
+    return fields
+
+
+def extract_structured_fields(text: str, doc_type: str) -> Dict[str, Optional[str]]:
+    """Extracts structured fields based on document type"""
+
+    if doc_type == 'IDENTITY_CARD':
+        return extract_id_fields(text)
+    elif doc_type == 'PASSPORT':
+        return extract_passport_fields(text)
+ #   elif doc_type == 'DRIVING_LICENSE':
+ #       return extract_license_fields(text)
+    else:
+        return {}
+
+# Logging setup - MORE DETAILED
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Environment variables
+QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "mistral")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "ollama")
+OLLAMA_PORT = os.getenv("OLLAMA_PORT", "11434")
+OLLAMA_BASE_URL = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
+CUDA_VISIBLE_DEVICES = os.getenv("CUDA_VISIBLE_DEVICES", "0")
+RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.3"))
+MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "100"))  # Default 100MB
+BACKUP_DIR = os.getenv("BACKUP_DIR", "/app/backups")
+
+# Create upload folder if it doesn't exist
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# FastAPI App
+app = FastAPI(
+    title="RAG Enterprise Backend",
+    description="API for Distributed RAG Pipeline",
+    version="1.0.0"
+)
+
+# CORS configuration
+# Read ALLOWED_ORIGINS from environment variable
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
+if allowed_origins_env:
+    # Split by comma and strip whitespace
+    allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",")]
+    logging.info(f"CORS: Restricted to specific origins: {allowed_origins}")
+else:
+    # Default: allow all (development mode)
+    allowed_origins = ["*"]
+    logging.warning("CORS: ALLOWED_ORIGINS not set - allowing all origins (*)")
+    logging.warning("For production, set ALLOWED_ORIGINS in .env (e.g., https://yourdomain.com)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global services
+ocr_service: Optional[OCRService] = None
+embeddings_service: Optional[EmbeddingsService] = None
+rag_pipeline: Optional[RAGPipeline] = None
+qdrant_connector: Optional[QdrantConnector] = None
+
+# Conversational memory for users
+user_conversations: dict = {}  # {user_id: [{"user": "...", "assistant": "..."}]}
+
+# Backup scheduler
+backup_scheduler = BackupScheduler(backup_service)
+
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services at startup"""
+    global ocr_service, embeddings_service, rag_pipeline, qdrant_connector
+
+    logger.info("=" * 80)
+    logger.info("🚀 STARTING RAG BACKEND")
+    logger.info("=" * 80)
+    logger.info(f"Configuration:")
+    logger.info(f"  - QDRANT: {QDRANT_HOST}:{QDRANT_PORT}")
+    logger.info(f"  - OLLAMA: {OLLAMA_BASE_URL}")
+    logger.info(f"  - LLM: {LLM_MODEL}")
+    logger.info(f"  - Embedding: {EMBEDDING_MODEL}")
+    logger.info(f"  - Relevance Threshold: {RELEVANCE_THRESHOLD}")
+    logger.info(f"  - Upload Dir: {UPLOAD_DIR}")
+    logger.info(f"  - CUDA Devices: {CUDA_VISIBLE_DEVICES}")
+    logger.info("=" * 80)
+    
+    try:
+        # 1. Qdrant Connection
+        logger.info("🔗 [1/6] Connecting to Qdrant...")
+        qdrant_connector = QdrantConnector(
+            host=QDRANT_HOST,
+            port=QDRANT_PORT,
+            api_key=QDRANT_API_KEY if QDRANT_API_KEY else None
+        )
+        qdrant_connector.connect()
+        logger.info("✅ Qdrant connected")
+
+        # 2. OCR Service
+        logger.info("🔗 [2/6] Loading OCR Service...")
+        try:
+            ocr_service = OCRService()
+            logger.info("✅ OCR Service ready")
+        except Exception as e:
+            logger.warning(f"⚠️  OCR Service failed: {e}")
+            logger.warning("    → System will continue without OCR")
+            ocr_service = None
+
+        # 3. Embedding Service
+        logger.info(f"🔗 [3/6] Loading Embedding Service ({EMBEDDING_MODEL})...")
+        embeddings_service = EmbeddingsService(model_name=EMBEDDING_MODEL)
+        logger.info("✅ Embedding Service ready")
+
+        # 4. Ollama readiness + model auto-pull
+        logger.info(f"🔗 [4/6] Connecting to Ollama ({OLLAMA_BASE_URL})...")
+        wait_for_ollama(OLLAMA_BASE_URL, timeout=300)
+        ensure_model(OLLAMA_BASE_URL, LLM_MODEL)
+
+        # 5. RAG Pipeline
+        logger.info(f"🔗 [5/6] Initializing RAG Pipeline (LLM: {LLM_MODEL})...")
+        rag_pipeline = RAGPipeline(
+            qdrant_connector=qdrant_connector,
+            embeddings_service=embeddings_service,
+            llm_model=LLM_MODEL,
+            ollama_base_url=OLLAMA_BASE_URL,
+            relevance_threshold=RELEVANCE_THRESHOLD
+        )
+        logger.info("✅ RAG Pipeline ready")
+
+        # 6. Backup Scheduler
+        logger.info("🔗 [6/6] Starting Backup Scheduler...")
+        backup_scheduler.start()
+        logger.info("✅ Backup Scheduler ready")
+
+        logger.info("=" * 80)
+        logger.info("🎉 BACKEND FULLY INITIALIZED")
+        logger.info("=" * 80)
+
+    except Exception as e:
+        logger.error("=" * 80)
+        logger.error(f"❌ ERROR DURING STARTUP: {str(e)}")
+        logger.error(traceback.format_exc())
+        logger.error("=" * 80)
+        raise
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup at shutdown"""
+    logger.info("🛑 Shutting down RAG Backend...")
+    backup_scheduler.stop()
+    if qdrant_connector:
+        qdrant_connector.disconnect()
+    logger.info("✅ Cleanup completed")
+
+
+# ============================================================================
+# PYDANTIC MODELS
+# ============================================================================
+
+class ConversationCreate(BaseModel):
+    name: str = "New Conversation"
+    conversation_id: str  # client-generated ID (matches localStorage key)
+
+
+class ConversationRename(BaseModel):
+    name: str
+
+
+class ConversationInfo(BaseModel):
+    id: str
+    name: str
+    created_at: str
+    document_ids: List[str]
+
+
+class QueryRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    temperature: float = 0.0
+    conversation_id: Optional[str] = None  # scope search to this conversation's docs
+
+
+class SourceInfo(BaseModel):
+    filename: str
+    document_id: str
+    similarity_score: float
+    chunk_index: Optional[int] = None
+    text: Optional[str] = None 
+
+
+class QueryResponse(BaseModel):
+    answer: str
+    sources: List[SourceInfo]
+    processing_time: float
+    num_sources: int
+
+
+class DocumentMetadata(BaseModel):
+    filename: str
+    upload_date: str
+    document_id: str
+    num_chunks: int
+    status: str
+
+
+class DocumentsListResponse(BaseModel):
+    documents: List[DocumentMetadata]
+    total: int
+
+
+class HealthResponse(BaseModel):
+    status: str
+    backend_version: str
+    qdrant_connected: bool
+    services: dict
+    configuration: dict
+
+
+# ============================================================================
+# HEALTH & INFO ENDPOINTS
+# ============================================================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint"""
+    all_ready = all([ocr_service, embeddings_service, rag_pipeline, qdrant_connector])
+    
+    return HealthResponse(
+        status="healthy" if all_ready else "degraded",
+        backend_version="1.0.0",
+        qdrant_connected=qdrant_connector.is_connected() if qdrant_connector else False,
+        services={
+            "ocr": ocr_service is not None,
+            "embeddings": embeddings_service is not None,
+            "rag_pipeline": rag_pipeline is not None,
+            "qdrant": qdrant_connector is not None
+        },
+        configuration={
+            "llm_model": LLM_MODEL,
+            "embedding_model": EMBEDDING_MODEL,
+            "relevance_threshold": RELEVANCE_THRESHOLD,
+        }
+    )
+
+
+@app.get("/info")
+async def get_info():
+    """Configuration information"""
+    return {
+        "backend": "RAG Enterprise v1.0.0",
+        "qdrant": f"{QDRANT_HOST}:{QDRANT_PORT}",
+        "llm_model": LLM_MODEL,
+        "embedding_model": EMBEDDING_MODEL,
+        "cuda_devices": CUDA_VISIBLE_DEVICES,
+        "relevance_threshold": RELEVANCE_THRESHOLD,
+    }
+
+
+# ============================================================================
+# AUTHENTICATION ENDPOINTS
+# ============================================================================
+
+@app.post("/api/auth/login", response_model=LoginResponse)
+async def login(request: LoginRequest):
+    """
+    User login - returns JWT token
+
+    Default credentials:
+    - Admin: username=admin, password=<from logs or ADMIN_DEFAULT_PASSWORD env var>
+    - Get password: docker compose logs backend | grep "Password:"
+    """
+    user = db.authenticate_user(request.username, request.password)
+
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password"
+        )
+
+    # Create JWT token
+    token = create_user_token(user)
+
+    logger.info(f"✅ Login successful: {user['username']} (role: {user['role']})")
+
+    return LoginResponse(
+        access_token=token,
+        token_type="bearer",
+        user=UserInfo(
+            id=user["id"],
+            username=user["username"],
+            email=user["email"],
+            role=user["role"],
+            created_at=user["created_at"],
+            last_login=user.get("last_login")
+        )
+    )
+
+
+@app.get("/api/auth/me", response_model=UserInfo)
+async def get_current_user_info(current_user: CurrentUser = Depends(get_current_user)):
+    """Get current user information"""
+    user = db.get_user_by_id(current_user.user_id)
+
+    return UserInfo(
+        id=user["id"],
+        username=user["username"],
+        email=user["email"],
+        role=user["role"],
+        created_at=user["created_at"],
+        last_login=user.get("last_login")
+    )
+
+
+@app.get("/api/auth/users", response_model=UserListResponse)
+async def list_users(current_user: CurrentUser = Depends(require_admin)):
+    """List all users (ADMIN only)"""
+    users = db.list_users()
+
+    return UserListResponse(
+        users=[
+            UserInfo(
+                id=u["id"],
+                username=u["username"],
+                email=u["email"],
+                role=u["role"],
+                created_at=u["created_at"],
+                last_login=u.get("last_login")
+            )
+            for u in users
+        ],
+        total=len(users)
+    )
+
+
+@app.post("/api/auth/users", response_model=UserInfo)
+async def create_user(
+    user_data: UserCreate,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """Create new user (ADMIN only)"""
+    user_id = db.create_user(
+        username=user_data.username,
+        email=user_data.email,
+        password=user_data.password,
+        role=user_data.role
+    )
+
+    if not user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="User creation error (username or email already exists)"
+        )
+
+    user = db.get_user_by_id(user_id)
+
+    return UserInfo(
+        id=user["id"],
+        username=user["username"],
+        email=user["email"],
+        role=user["role"],
+        created_at=user["created_at"],
+        last_login=user.get("last_login")
+    )
+
+
+@app.put("/api/auth/users/{user_id}", response_model=MessageResponse)
+async def update_user(
+    user_id: int,
+    user_data: UserUpdate,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """Update user (ADMIN only)"""
+    if user_data.role:
+        success = db.update_user_role(user_id, user_data.role)
+        if not success:
+            raise HTTPException(status_code=404, detail="User not found")
+
+    return MessageResponse(message=f"User {user_id} updated")
+
+
+@app.delete("/api/auth/users/{user_id}", response_model=MessageResponse)
+async def delete_user(
+    user_id: int,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """Delete user (ADMIN only)"""
+    # Don't allow self-deletion
+    if user_id == current_user.user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot delete your own account"
+        )
+
+    success = db.delete_user(user_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return MessageResponse(message=f"User {user_id} deleted")
+
+
+@app.post("/api/auth/change-password", response_model=MessageResponse)
+async def change_password(
+    request: PasswordChange,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """Change current user's password"""
+    user = db.get_user_by_id(current_user.user_id)
+
+    # Verify old password
+    if not db.verify_password(request.old_password, user["password_hash"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Current password is incorrect"
+        )
+
+    # Change password
+    success = db.change_password(current_user.user_id, request.new_password)
+
+    if not success:
+        raise HTTPException(status_code=500, detail="Password change error")
+
+    logger.info(f"✅ Password changed for user: {current_user.username}")
+
+    return MessageResponse(message="Password changed successfully")
+
+
+# ============================================================================
+# CONVERSATIONS
+# ============================================================================
+
+@app.post("/api/conversations", response_model=ConversationInfo)
+async def create_conversation(
+    data: ConversationCreate,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """Create or sync a conversation (idempotent — safe to call on every new chat)"""
+    existing = db.get_conversation(data.conversation_id, current_user.user_id)
+    if existing:
+        return ConversationInfo(**existing)
+    db.create_conversation(current_user.user_id, data.name, data.conversation_id)
+    return ConversationInfo(
+        id=data.conversation_id,
+        name=data.name,
+        created_at="",
+        document_ids=[]
+    )
+
+
+@app.get("/api/conversations", response_model=List[ConversationInfo])
+async def list_conversations(current_user: CurrentUser = Depends(get_current_user)):
+    """List all conversations for the current user"""
+    convs = db.list_conversations(current_user.user_id)
+    return [ConversationInfo(**c) for c in convs]
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """Delete a conversation (does NOT delete its documents from Qdrant)"""
+    db.delete_conversation(conversation_id, current_user.user_id)
+    return {"message": f"Conversation {conversation_id} deleted"}
+
+
+@app.patch("/api/conversations/{conversation_id}", response_model=ConversationInfo)
+async def rename_conversation(
+    conversation_id: str,
+    data: ConversationRename,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """Rename a conversation"""
+    db.rename_conversation(conversation_id, current_user.user_id, data.name)
+    conv = db.get_conversation(conversation_id, current_user.user_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return ConversationInfo(**conv)
+
+
+# ============================================================================
+# DOCUMENT MANAGEMENT
+# ============================================================================
+
+# Supported formats
+ALLOWED_EXTENSIONS = {
+    '.pdf', '.txt', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx',
+    '.odt', '.rtf', '.html', '.xml', '.json', '.csv', '.md',
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp'
+}
+
+@app.post("/api/documents/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    conversation_id: Optional[str] = Form(None),
+    background_tasks: BackgroundTasks = None,
+    current_user: CurrentUser = Depends(require_upload_permission)
+):
+    """
+    Upload a document (any format) and process it in the background
+    Supported formats: PDF, DOCX, PPTX, XLSX, ODT, RTF, HTML, XML, JSON, CSV, Images
+
+    Requires: SUPER_USER or ADMIN role
+    """
+
+    if not ocr_service or not embeddings_service or not rag_pipeline:
+        raise HTTPException(
+            status_code=503,
+            detail="Services not initialized. Check /health"
+        )
+
+    # Check file extension
+    from pathlib import Path
+    file_ext = Path(file.filename).suffix.lower()
+
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Format '{file_ext}' not supported. Supported: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+
+    # Check file size before reading entire content
+    # First read content to check size
+    content = await file.read()
+    file_size_mb = len(content) / (1024 * 1024)
+
+    if file_size_mb > MAX_UPLOAD_SIZE_MB:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large: {file_size_mb:.1f}MB. Maximum allowed: {MAX_UPLOAD_SIZE_MB}MB"
+        )
+
+    try:
+        # Create document_id with timestamp FIRST
+        document_id = f"{datetime.now().timestamp()}_{file.filename}"
+        file_path = os.path.join(UPLOAD_DIR, document_id)
+        # Note: content was already read above for size validation
+
+        # Save file with the document_id (with timestamp)
+        with open(file_path, "wb") as f:
+            f.write(content)
+
+        logger.info(f"📄 File received: '{file.filename}' ({len(content)} bytes)")
+        logger.info(f"   Document ID: {document_id}")
+        logger.info(f"   File path: {file_path}")
+
+        # Associate document with conversation immediately (before background processing)
+        if conversation_id:
+            conv = db.get_conversation(conversation_id, current_user.user_id)
+            if not conv:
+                # Auto-create conversation if it doesn't exist yet
+                db.create_conversation(current_user.user_id, "New Conversation", conversation_id)
+            db.add_document_to_conversation(conversation_id, document_id)
+            logger.info(f"   Linked to conversation: {conversation_id}")
+
+        # Add background task
+        background_tasks.add_task(
+            process_document_background,
+            file_path,
+            document_id,
+            file.filename
+        )
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "Document received, processing in progress",
+                "document_id": document_id,
+                "filename": file.filename,
+                "size_bytes": len(content),
+                "conversation_id": conversation_id
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Upload error: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def process_document_background(file_path: str, document_id: str, filename: str):
+    """Background task to process document - DETAILED LOGGING"""
+    text = None
+    chunks = None
+
+    try:
+        logger.info("=" * 80)
+        logger.info(f"📇 PROCESSING START: {filename}")
+        logger.info(f"   Document ID: {document_id}")
+        logger.info(f"   File path: {file_path}")
+        logger.info("=" * 80)
+
+        # STEP 1: OCR Extraction
+        logger.info(f"  [1/3] OCR Extraction...")
+        start_ocr = datetime.now()
+
+        try:
+            text = ocr_service.extract_text(file_path)
+
+            # NEW: Detect document type and extract structured fields
+            doc_type = detect_document_type(text)
+            structured_fields = extract_structured_fields(text, doc_type)
+
+            logger.info(f"Document Type: {doc_type}")
+            logger.info(f"Structured Fields: {structured_fields}")
+        except Exception as e:
+            logger.error(f"      ❌ OCR FAILED: {str(e)}", exc_info=True)
+            text = ""
+
+        ocr_time = (datetime.now() - start_ocr).total_seconds()
+        logger.info(f"        ✅ Extracted {len(text)} characters in {ocr_time:.2f}s")
+
+        if not text or len(text.strip()) == 0:
+            logger.warning(f"⚠️  WARNING: OCR returned empty text!")
+            return
+        
+        # STEP 2: Chunking
+        logger.info(f"  [2/3] Document Chunking...")
+        start_chunk = datetime.now()
+
+        try:
+            chunks = rag_pipeline.chunk_text(text, chunk_size=1000, overlap=100)
+        except Exception as e:
+            logger.error(f"      ❌ CHUNKING FAILED: {str(e)}", exc_info=True)
+            return
+
+        chunk_time = (datetime.now() - start_chunk).total_seconds()
+        logger.info(f"        ✅ {len(chunks)} chunks created in {chunk_time:.2f}s")
+
+        if not chunks:
+            logger.error(f"❌ ERROR: No chunks created!")
+            return
+        
+        # STEP 3: Embedding & Indexing
+        logger.info(f"  [3/3] Embedding & Indexing...")
+        start_index = datetime.now()
+
+        try:
+            rag_pipeline.index_chunks(
+                chunks=chunks,
+                document_id=document_id,
+                filename=filename,
+                document_type=doc_type,
+                structured_fields=structured_fields
+            )
+        except Exception as e:
+            logger.error(f"      ❌ INDEXING FAILED: {str(e)}", exc_info=True)
+            return
+
+        index_time = (datetime.now() - start_index).total_seconds()
+        logger.info(f"        ✅ Indexed on Qdrant in {index_time:.2f}s")
+
+        # SUMMARY
+        total_time = (datetime.now() - start_ocr).total_seconds()
+        logger.info("=" * 80)
+        logger.info(f"✅ PROCESSING COMPLETED: {filename}")
+        logger.info(f"   Total time: {total_time:.2f}s")
+        logger.info(f"   - OCR: {ocr_time:.2f}s")
+        logger.info(f"   - Chunking: {chunk_time:.2f}s")
+        logger.info(f"   - Indexing: {index_time:.2f}s")
+        logger.info(f"   Chunks: {len(chunks)}")
+        logger.info(f"   Characters: {len(text)}")
+        logger.info("=" * 80)
+
+    except Exception as e:
+        logger.error("=" * 80)
+        logger.error(f"❌ CRITICAL PROCESSING ERROR {filename}: {str(e)}")
+        logger.error(traceback.format_exc())
+        logger.error("=" * 80)
+
+    finally:
+        # 🧹 CRITICAL: Memory cleanup to prevent OOM on next upload
+        logger.info("🧹 Cleaning up memory...")
+
+        # Delete large variables
+        if text is not None:
+            del text
+        if chunks is not None:
+            del chunks
+
+        # Force Python garbage collection
+        gc.collect()
+
+        # Clear GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            logger.info(f"   GPU memory after cleanup: {allocated:.2f}GB")
+
+        logger.info("✅ Memory cleanup completed")
+
+
+@app.get("/api/documents", response_model=DocumentsListResponse)
+async def list_documents():
+    """List indexed documents"""
+    if not qdrant_connector:
+        raise HTTPException(status_code=503, detail="Qdrant not connected")
+
+    try:
+        docs = qdrant_connector.get_indexed_documents()
+        return DocumentsListResponse(
+            documents=docs,
+            total=len(docs)
+        )
+    except Exception as e:
+        logger.error(f"Error listing documents: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/documents/{document_id}/download")
+async def download_document(document_id: str):
+    """Download the original uploaded document"""
+    from fastapi.responses import FileResponse
+    import glob
+
+    try:
+        # Search for the file in the upload folder
+        # The document_id has format: timestamp_filename.ext
+        search_pattern = os.path.join(UPLOAD_DIR, f"{document_id}")
+
+        # Check if the file exists exactly
+        if os.path.exists(search_pattern):
+            file_path = search_pattern
+        else:
+            # Otherwise search with wildcard (in case the path is slightly different)
+            files = glob.glob(search_pattern)
+            if not files:
+                raise HTTPException(status_code=404, detail=f"Document not found: {document_id}")
+            file_path = files[0]
+
+        logger.info(f"📥 Download document: {document_id}")
+        logger.info(f"   Path: {file_path}")
+
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
+
+        # Extract the original file name (without timestamp)
+        # Format: 1762533561.231156_TU-81-08-Ed.-Gennaio-2025-1.pdf
+        filename = os.path.basename(file_path)
+        original_filename = filename.split('_', 1)[1] if '_' in filename else filename
+
+        return FileResponse(
+            path=file_path,
+            media_type='application/octet-stream',
+            filename=original_filename
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Download error: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/documents/{document_id}")
+async def delete_document(
+    document_id: str,
+    current_user: CurrentUser = Depends(require_delete_permission)
+):
+    """
+    Delete document from index
+
+    Requires: SUPER_USER or ADMIN role
+    """
+    if not qdrant_connector:
+        raise HTTPException(status_code=503, detail="Qdrant not connected")
+
+    try:
+        logger.info(f"🗑️  Deleting document: {document_id}")
+        qdrant_connector.delete_document(document_id)
+        logger.info(f"✅ Document deleted: {document_id}")
+        return {"message": f"Document {document_id} deleted"}
+    except Exception as e:
+        logger.error(f"Deletion error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# RAG QUERY
+# ============================================================================
+
+@app.post("/api/query", response_model=QueryResponse)
+async def query_rag(
+    request: QueryRequest,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Main query - Complete RAG Pipeline WITH CONVERSATIONAL MEMORY
+
+    Requires: Authentication (all roles can make queries)
+
+    Processes:
+    1. Retrieve conversation history for the user
+    2. Query embedding
+    3. Retrieval from Qdrant
+    4. LLM generation with historical context
+    5. Save response in memory
+    6. Return answer + sources
+    """
+
+    # Use real user ID instead of "default"
+    user_id = str(current_user.user_id)
+    if not rag_pipeline:
+        raise HTTPException(status_code=503, detail="RAG Pipeline not initialized")
+    
+    try:
+        start_time = datetime.now()
+
+        # Use conversation_id as memory key (falls back to user_id for unscoped queries)
+        memory_key = request.conversation_id if request.conversation_id else user_id
+        if memory_key not in user_conversations:
+            user_conversations[memory_key] = []
+
+        conversation_history = user_conversations[memory_key]
+
+        # Resolve document scope for this conversation
+        document_ids = None
+        if request.conversation_id:
+            conv = db.get_conversation(request.conversation_id, int(user_id))
+            if conv and conv["document_ids"]:
+                document_ids = conv["document_ids"]
+                logger.info(f"   Scoped to conversation {request.conversation_id}: {len(document_ids)} doc(s)")
+            elif conv is not None and not conv["document_ids"]:
+                # Conversation exists but has no documents — refuse the search
+                processing_time = (datetime.now() - start_time).total_seconds()
+                return QueryResponse(
+                    answer="This conversation has no documents yet. Please upload a document first before asking questions.",
+                    sources=[],
+                    processing_time=processing_time,
+                    num_sources=0
+                )
+
+        logger.info("=" * 80)
+        logger.info(f"❓ QUERY (user: {user_id}): '{request.query}'")
+        logger.info(f"   top_k: {request.top_k}")
+        logger.info(f"   temperature: {request.temperature}")
+        logger.info(f"   History length: {len(conversation_history)} exchanges")
+        logger.info("=" * 80)
+
+        # Pass history and document scope to the pipeline
+        answer, sources = rag_pipeline.query(
+            query=request.query,
+            top_k=request.top_k,
+            temperature=request.temperature,
+            history=conversation_history,
+            document_ids=document_ids
+        )
+
+        # Save the new exchange in memory
+        conversation_history.append({
+            "user": request.query,
+            "assistant": answer
+        })
+
+        # Limit to last 20 exchanges to not consume too much memory
+        if len(conversation_history) > 20:
+            user_conversations[memory_key] = conversation_history[-20:]
+
+        processing_time = (datetime.now() - start_time).total_seconds()
+
+        logger.info("=" * 80)
+        logger.info(f"✅ QUERY COMPLETED in {processing_time:.2f}s")
+        logger.info(f"   Answer length: {len(answer)} chars")
+        logger.info(f"   Sources: {len(sources)}")
+        for src in sources:
+            logger.info(f"     - {src['filename']} (relevance: {src['similarity_score']:.2%})")
+        logger.info(f"   Conversation saved ({len(user_conversations[memory_key])} exchanges)")
+        logger.info("=" * 80)
+        
+        return QueryResponse(
+            answer=answer,
+            sources=[SourceInfo(**src) for src in sources],
+            processing_time=processing_time,
+            num_sources=len(sources)
+        )
+        
+    except Exception as e:
+        logger.error("=" * 80)
+        logger.error(f"❌ QUERY ERROR: {str(e)}")
+        logger.error(traceback.format_exc())
+        logger.error("=" * 80)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# ADMIN ENDPOINTS
+# ============================================================================
+
+@app.post("/api/admin/reindex-all")
+async def reindex_all(background_tasks: BackgroundTasks):
+    """Reindex all documents"""
+    if not rag_pipeline:
+        raise HTTPException(status_code=503, detail="RAG Pipeline not initialized")
+
+    logger.info("🔄 Starting reindexing of all documents...")
+    background_tasks.add_task(rag_pipeline.reindex_all_documents)
+    return {"message": "Reindexing in progress..."}
+
+
+@app.delete("/api/admin/memory/{user_id}")
+async def clear_user_memory(user_id: str):
+    """Clear conversational memory for a specific user"""
+    if user_id in user_conversations:
+        num_exchanges = len(user_conversations[user_id])
+        del user_conversations[user_id]
+        logger.info(f"🧹 Memory cleared for user '{user_id}' ({num_exchanges} exchanges removed)")
+        return {
+            "message": f"Memory cleared for user '{user_id}'",
+            "exchanges_removed": num_exchanges
+        }
+    else:
+        return {
+            "message": f"No memory found for user '{user_id}'",
+            "exchanges_removed": 0
+        }
+
+
+@app.delete("/api/admin/memory")
+async def clear_all_memory():
+    """Clear ALL conversational memory for all users"""
+    total_users = len(user_conversations)
+    total_exchanges = sum(len(conv) for conv in user_conversations.values())
+    user_conversations.clear()
+    logger.info(f"🧹 Global memory cleared: {total_users} users, {total_exchanges} total exchanges")
+    return {
+        "message": "Global memory cleared",
+        "users_removed": total_users,
+        "exchanges_removed": total_exchanges
+    }
+
+
+@app.get("/api/admin/memory")
+async def get_memory_stats():
+    """Conversational memory statistics"""
+    stats = {
+        "total_users": len(user_conversations),
+        "users": {}
+    }
+    for user_id, history in user_conversations.items():
+        stats["users"][user_id] = {
+            "exchanges": len(history),
+            "last_questions": [msg["user"] for msg in history[-3:]]
+        }
+    return stats
+
+
+@app.get("/api/admin/stats")
+async def get_stats():
+    """System statistics"""
+    if not qdrant_connector:
+        raise HTTPException(status_code=503, detail="Qdrant not connected")
+
+    try:
+        return qdrant_connector.get_stats()
+    except Exception as e:
+        logger.error(f"Statistics error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# BACKUP & RESTORE ENDPOINTS
+# ============================================================================
+
+@app.get("/api/admin/backup/status")
+async def get_backup_status(current_user: CurrentUser = Depends(require_admin)):
+    """Get backup system status"""
+    return backup_service.get_status()
+
+
+@app.get("/api/admin/backup/providers")
+async def list_backup_providers(current_user: CurrentUser = Depends(require_admin)):
+    """List configured cloud providers and supported types"""
+    return {
+        "providers": backup_service.list_providers(),
+        "supported_types": backup_service.get_supported_providers()
+    }
+
+
+@app.post("/api/admin/backup/providers")
+async def add_backup_provider(
+    provider: BackupProviderCreate,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """
+    Add a new cloud provider for backup.
+
+    Example configurations:
+    - Mega: {"name": "mega", "type": "mega", "config": {"user": "email", "pass": "password"}}
+    - S3: {"name": "aws", "type": "s3", "config": {"provider": "AWS", "access_key_id": "...", "secret_access_key": "...", "region": "eu-west-1"}}
+    - Google Drive: {"name": "gdrive", "type": "drive", "config": {"token": "{...}"}}
+    - WebDAV/Nextcloud: {"name": "nextcloud", "type": "webdav", "config": {"url": "https://...", "user": "...", "pass": "..."}}
+    """
+    return backup_service.add_provider(
+        name=provider.name,
+        provider_type=provider.type,
+        config=provider.config
+    )
+
+
+@app.delete("/api/admin/backup/providers/{name}")
+async def remove_backup_provider(
+    name: str,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """Remove a configured cloud provider"""
+    backup_service.remove_provider(name)
+    return {"message": f"Provider '{name}' removed"}
+
+
+@app.post("/api/admin/backup/providers/{name}/test")
+async def test_backup_provider(
+    name: str,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """Test connection to a cloud provider"""
+    return backup_service.test_provider(name)
+
+
+@app.post("/api/admin/backup/run")
+async def run_backup(
+    request: BackupRunRequest,
+    background_tasks: BackgroundTasks,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """
+    Trigger a manual backup.
+
+    If 'provider' is specified, the backup will be uploaded to that cloud provider.
+    Otherwise, it will be stored locally only.
+    """
+    background_tasks.add_task(
+        _execute_manual_backup, request.provider, request.remote_path
+    )
+    return {"message": "Backup started", "status": "running"}
+
+
+def _execute_manual_backup(provider: Optional[str], remote_path: str):
+    """Execute manual backup in background"""
+    start_time = datetime.now()
+    entry = {
+        "type": "manual",
+        "started_at": start_time.isoformat(),
+        "provider": provider
+    }
+
+    try:
+        result = backup_service.create_backup()
+        entry["backup_name"] = result["backup_name"]
+        entry["size_bytes"] = result["size_bytes"]
+
+        if provider:
+            upload_result = backup_service.upload_to_cloud(
+                result["archive_path"], provider, remote_path
+            )
+            entry["cloud_upload"] = upload_result
+
+        entry["status"] = "success"
+        entry["duration_seconds"] = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Manual backup completed: {result['backup_name']}")
+
+    except Exception as e:
+        entry["status"] = "error"
+        entry["error"] = str(e)
+        entry["duration_seconds"] = (datetime.now() - start_time).total_seconds()
+        logger.error(f"Manual backup failed: {e}")
+
+    finally:
+        backup_service.log_backup(entry)
+
+
+@app.get("/api/admin/backup/schedule")
+async def get_backup_schedule(current_user: CurrentUser = Depends(require_admin)):
+    """Get current backup schedule"""
+    return backup_scheduler.get_schedule()
+
+
+@app.post("/api/admin/backup/schedule")
+async def set_backup_schedule(
+    request: BackupScheduleRequest,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """
+    Set or update the backup schedule.
+
+    Cron expression examples:
+    - "0 2 * * *"     → Daily at 2:00 AM
+    - "0 3 * * 0"     → Weekly on Sunday at 3:00 AM
+    - "0 1 1 * *"     → Monthly on the 1st at 1:00 AM
+    - "0 */6 * * *"   → Every 6 hours
+    """
+    return backup_scheduler.set_schedule(
+        cron_expression=request.cron,
+        provider=request.provider,
+        remote_path=request.remote_path,
+        retention=request.retention,
+        enabled=request.enabled
+    )
+
+
+@app.get("/api/admin/backup/history")
+async def get_backup_history(current_user: CurrentUser = Depends(require_admin)):
+    """Get backup execution history"""
+    return {"history": backup_service.get_history()}
+
+
+@app.get("/api/admin/backup/local")
+async def list_local_backups(current_user: CurrentUser = Depends(require_admin)):
+    """List local backup files"""
+    return {"backups": backup_service.list_local_backups()}
+
+
+@app.delete("/api/admin/backup/local/{filename}")
+async def delete_local_backup(
+    filename: str,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """Delete a local backup file"""
+    if backup_service.delete_local_backup(filename):
+        return {"message": f"Backup '{filename}' deleted"}
+    raise HTTPException(status_code=404, detail="Backup not found")
+
+
+@app.get("/api/admin/backup/cloud/{provider}")
+async def list_cloud_backups(
+    provider: str,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """List backups stored on a cloud provider"""
+    return {"backups": backup_service.list_cloud_backups(provider)}
+
+
+@app.post("/api/admin/backup/cloud/{provider}/download")
+async def download_cloud_backup(
+    provider: str,
+    filename: str,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """Download a backup from cloud to local storage"""
+    local_path = backup_service.download_from_cloud(provider, filename)
+    return {"message": f"Downloaded to {local_path}", "local_path": local_path}
+
+
+@app.post("/api/admin/backup/restore")
+async def restore_backup(
+    request: BackupRestoreRequest,
+    background_tasks: BackgroundTasks,
+    current_user: CurrentUser = Depends(require_admin)
+):
+    """
+    Restore from a local backup archive.
+
+    WARNING: This will overwrite current data. Use with caution.
+    """
+    archive_path = os.path.join(BACKUP_DIR, request.filename)
+    if not os.path.exists(archive_path):
+        raise HTTPException(status_code=404, detail="Backup file not found")
+
+    background_tasks.add_task(
+        _execute_restore,
+        archive_path,
+        request.restore_db,
+        request.restore_uploads,
+        request.restore_qdrant
+    )
+    return {"message": "Restore started", "status": "running"}
+
+
+def _execute_restore(archive_path: str, restore_db: bool, restore_uploads: bool, restore_qdrant: bool):
+    """Execute restore in background"""
+    try:
+        result = backup_service.restore_from_backup(
+            archive_path, restore_db, restore_uploads, restore_qdrant
+        )
+        logger.info(f"Restore completed: {result}")
+    except Exception as e:
+        logger.error(f"Restore failed: {e}")
+
+
+# ============================================================================
+# ROOT
+# ============================================================================
+
+@app.get("/")
+async def root():
+    """Endpoint root"""
+    return {
+        "message": "RAG Enterprise Backend v1.0.0",
+        "docs": "/docs",
+        "health": "/health",
+        "info": "/info"
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )

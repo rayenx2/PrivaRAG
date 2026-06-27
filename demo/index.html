@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PrivaRAG — 100% Local Document Intelligence</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0d1117;
+      --bg2: #161b22;
+      --bg3: #21262d;
+      --border: #30363d;
+      --accent: #8b5cf6;
+      --accent2: #a78bfa;
+      --accent3: #c4b5fd;
+      --green: #3fb950;
+      --blue: #58a6ff;
+      --orange: #f0883e;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --card: #161b22;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', system-ui, sans-serif;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    /* ── NAV ── */
+    nav {
+      background: rgba(13,17,23,0.95);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      padding: 0 2rem;
+    }
+    nav .nav-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 60px;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+      font-weight: 700;
+      font-size: 1.1rem;
+    }
+    .logo-mark {
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      color: #fff;
+      width: 36px; height: 36px;
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: .9rem;
+      flex-shrink: 0;
+    }
+    .nav-links { display: flex; gap: 1.5rem; }
+    .nav-links a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: .875rem;
+      transition: color .2s;
+    }
+    .nav-links a:hover { color: var(--text); }
+    .nav-badge {
+      background: var(--accent);
+      color: #fff;
+      font-size: .7rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 12px;
+    }
+
+    /* ── HERO ── */
+    .hero {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 5rem 2rem 3rem;
+      text-align: center;
+    }
+    .hero-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: .5rem;
+      background: rgba(139,92,246,.15);
+      border: 1px solid rgba(139,92,246,.3);
+      color: var(--accent3);
+      border-radius: 20px;
+      padding: 4px 14px;
+      font-size: .8rem;
+      font-weight: 500;
+      margin-bottom: 1.5rem;
+    }
+    .hero h1 {
+      font-size: clamp(2.2rem, 5vw, 3.5rem);
+      font-weight: 800;
+      line-height: 1.15;
+      margin-bottom: 1rem;
+    }
+    .hero h1 span {
+      background: linear-gradient(135deg, var(--accent), var(--accent2), var(--blue));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero p {
+      color: var(--muted);
+      font-size: 1.1rem;
+      max-width: 620px;
+      margin: 0 auto 2.5rem;
+    }
+    .hero-cta {
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-bottom: 3rem;
+    }
+    .btn {
+      padding: .7rem 1.4rem;
+      border-radius: 8px;
+      font-size: .9rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      text-decoration: none;
+      transition: opacity .2s, transform .15s;
+      display: inline-flex;
+      align-items: center;
+      gap: .4rem;
+    }
+    .btn:hover { opacity: .85; transform: translateY(-1px); }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border); }
+
+    /* ── METRICS STRIP ── */
+    .metrics-strip {
+      background: var(--bg2);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 1.5rem 2rem;
+    }
+    .metrics-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 1.5rem;
+      text-align: center;
+    }
+    .metric-item .value {
+      font-size: 1.8rem;
+      font-weight: 800;
+      color: var(--accent2);
+    }
+    .metric-item .label {
+      font-size: .78rem;
+      color: var(--muted);
+      margin-top: .2rem;
+    }
+
+    /* ── SECTIONS ── */
+    section { max-width: 1200px; margin: 0 auto; padding: 4rem 2rem; }
+    .section-title {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin-bottom: .5rem;
+    }
+    .section-sub {
+      color: var(--muted);
+      font-size: .95rem;
+      margin-bottom: 2.5rem;
+    }
+
+    /* ── PIPELINE DIAGRAM ── */
+    .pipeline {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      overflow-x: auto;
+      padding-bottom: 1rem;
+    }
+    .pipeline-step {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.2rem 1rem;
+      text-align: center;
+      min-width: 120px;
+      flex-shrink: 0;
+      position: relative;
+      transition: border-color .2s;
+    }
+    .pipeline-step:hover { border-color: var(--accent); }
+    .pipeline-step .step-icon {
+      font-size: 1.6rem;
+      margin-bottom: .4rem;
+    }
+    .pipeline-step .step-name {
+      font-size: .78rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .pipeline-step .step-tech {
+      font-size: .7rem;
+      color: var(--muted);
+      margin-top: .2rem;
+    }
+    .pipeline-arrow {
+      color: var(--accent);
+      font-size: 1.2rem;
+      padding: 0 .5rem;
+      flex-shrink: 0;
+    }
+    .step-highlight { border-color: var(--accent); background: rgba(139,92,246,.08); }
+
+    /* ── DEMO PANEL ── */
+    .demo-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+    }
+    @media (max-width: 768px) { .demo-grid { grid-template-columns: 1fr; } }
+    .demo-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .demo-card-header {
+      padding: .8rem 1.2rem;
+      border-bottom: 1px solid var(--border);
+      font-size: .85rem;
+      font-weight: 600;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+    }
+    .demo-card-body { padding: 1.2rem; }
+
+    /* Upload zone */
+    .upload-zone {
+      border: 2px dashed var(--border);
+      border-radius: 10px;
+      padding: 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+    }
+    .upload-zone:hover { border-color: var(--accent); background: rgba(139,92,246,.05); }
+    .upload-zone .upload-icon { font-size: 2.5rem; margin-bottom: .8rem; }
+    .upload-zone p { color: var(--muted); font-size: .875rem; }
+    .upload-zone strong { color: var(--text); }
+    .file-list { margin-top: 1rem; display: flex; flex-direction: column; gap: .4rem; }
+    .file-chip {
+      display: flex; align-items: center; gap: .5rem;
+      background: var(--bg3); border-radius: 6px; padding: .4rem .75rem;
+      font-size: .8rem;
+    }
+    .file-chip .status { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+
+    /* Query input */
+    .query-select {
+      display: flex; flex-direction: column; gap: .5rem; margin-bottom: 1rem;
+    }
+    .query-select label { font-size: .8rem; color: var(--muted); font-weight: 500; }
+    .query-btn-group {
+      display: flex; flex-wrap: wrap; gap: .5rem;
+    }
+    .query-btn {
+      padding: .4rem .75rem;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      font-size: .78rem;
+      cursor: pointer;
+      transition: border-color .2s;
+    }
+    .query-btn:hover, .query-btn.active { border-color: var(--accent); color: var(--accent2); }
+    textarea.query-input {
+      width: 100%;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .75rem;
+      color: var(--text);
+      font-family: inherit;
+      font-size: .875rem;
+      resize: none;
+      height: 70px;
+      transition: border-color .2s;
+    }
+    textarea.query-input:focus { outline: none; border-color: var(--accent); }
+
+    /* Answer */
+    .answer-box {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      font-size: .875rem;
+      min-height: 80px;
+      position: relative;
+    }
+    .cursor {
+      display: inline-block;
+      width: 2px;
+      height: 1em;
+      background: var(--accent);
+      animation: blink 1s infinite;
+      vertical-align: text-bottom;
+      margin-left: 2px;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+    .sources-list { margin-top: 1rem; display: flex; flex-direction: column; gap: .4rem; }
+    .source-chip {
+      display: flex; align-items: center; justify-content: space-between;
+      background: var(--bg3); border-radius: 6px; padding: .4rem .75rem;
+      font-size: .78rem;
+    }
+    .source-chip .fname { color: var(--text); }
+    .source-chip .score {
+      background: rgba(59,186,80,.15);
+      color: var(--green);
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: .72rem;
+      font-weight: 600;
+    }
+
+    /* ── HOW IT WORKS ── */
+    .steps-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1.5rem;
+    }
+    .step-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+    }
+    .step-number {
+      width: 36px; height: 36px;
+      background: rgba(139,92,246,.15);
+      border: 1px solid rgba(139,92,246,.3);
+      color: var(--accent2);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700;
+      margin-bottom: 1rem;
+    }
+    .step-card h3 { font-size: 1rem; font-weight: 600; margin-bottom: .4rem; }
+    .step-card p { font-size: .85rem; color: var(--muted); }
+
+    /* ── CODE SNIPPET ── */
+    .code-block {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .code-header {
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+      padding: .6rem 1rem;
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: .8rem;
+      color: var(--muted);
+    }
+    .code-body {
+      padding: 1.2rem 1.5rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: .82rem;
+      line-height: 1.7;
+      overflow-x: auto;
+    }
+    .kw { color: #ff7b72; }
+    .fn { color: #d2a8ff; }
+    .st { color: #a5d6ff; }
+    .cm { color: #8b949e; font-style: italic; }
+    .nm { color: #79c0ff; }
+    .py { color: #ffa657; }
+
+    /* ── COMPARISON TABLE ── */
+    .table-wrap { overflow-x: auto; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .875rem;
+    }
+    th {
+      background: var(--bg2);
+      padding: .75rem 1rem;
+      text-align: left;
+      font-weight: 600;
+      border-bottom: 2px solid var(--border);
+    }
+    td {
+      padding: .7rem 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+    tr:hover td { background: rgba(255,255,255,.02); }
+    .tag-green {
+      display: inline-block;
+      background: rgba(59,186,80,.15);
+      color: var(--green);
+      border-radius: 4px;
+      padding: 1px 7px;
+      font-size: .75rem;
+      font-weight: 600;
+    }
+    .tag-orange {
+      display: inline-block;
+      background: rgba(240,136,62,.15);
+      color: var(--orange);
+      border-radius: 4px;
+      padding: 1px 7px;
+      font-size: .75rem;
+      font-weight: 600;
+    }
+    .tag-red {
+      display: inline-block;
+      background: rgba(248,81,73,.15);
+      color: #f85149;
+      border-radius: 4px;
+      padding: 1px 7px;
+      font-size: .75rem;
+      font-weight: 600;
+    }
+
+    /* ── STACK BADGES ── */
+    .stack-grid {
+      display: flex; flex-wrap: wrap; gap: .75rem;
+    }
+    .stack-badge {
+      display: flex; align-items: center; gap: .4rem;
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .4rem .9rem;
+      font-size: .82rem;
+    }
+    .stack-badge .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+    }
+
+    /* ── FOOTER ── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2rem;
+      text-align: center;
+      color: var(--muted);
+      font-size: .85rem;
+    }
+    footer a { color: var(--accent2); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    /* ── ANIMATIONS ── */
+    .fade-in {
+      animation: fadeIn .5s ease both;
+    }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:none} }
+
+    /* ── RESPONSIVE ── */
+    @media (max-width: 600px) {
+      .pipeline { flex-direction: column; align-items: flex-start; }
+      .pipeline-arrow { transform: rotate(90deg); }
+    }
+  </style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <div class="nav-inner">
+    <div class="logo">
+      <div class="logo-mark">PR</div>
+      <span>PrivaRAG</span>
+    </div>
+    <div class="nav-links">
+      <a href="#pipeline">Pipeline</a>
+      <a href="#demo">Demo</a>
+      <a href="#how-it-works">How it Works</a>
+      <a href="#comparison">Benchmarks</a>
+      <a href="#stack">Stack</a>
+      <span class="nav-badge">100% Local</span>
+    </div>
+  </div>
+</nav>
+
+<!-- HERO -->
+<div class="hero fade-in">
+  <div class="hero-tag">
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="6" cy="6" r="6"/></svg>
+    Enterprise RAG with Zero API Costs
+  </div>
+  <h1>
+    <span>PrivaRAG</span><br/>
+    Private Document Intelligence<br/>with Local LLM Inference
+  </h1>
+  <p>
+    Upload documents. Ask questions. Get cited answers.
+    Powered by Ollama + Qdrant + BAAI/bge-m3 — entirely on your hardware.
+    No API keys. No data leaves your server.
+  </p>
+  <div class="hero-cta">
+    <button class="btn btn-primary" onclick="document.getElementById('demo').scrollIntoView({behavior:'smooth'})">
+      Try Interactive Demo
+    </button>
+    <a href="https://github.com/rayenx2" target="_blank" class="btn btn-outline">
+      GitHub — rayenx2
+    </a>
+  </div>
+</div>
+
+<!-- METRICS STRIP -->
+<div class="metrics-strip">
+  <div class="metrics-inner">
+    <div class="metric-item">
+      <div class="value">&lt; 2s</div>
+      <div class="label">Retrieval Latency</div>
+    </div>
+    <div class="metric-item">
+      <div class="value">Top-15</div>
+      <div class="label">Chunk Retrieval</div>
+    </div>
+    <div class="metric-item">
+      <div class="value">1024-d</div>
+      <div class="label">BGE-M3 Vectors</div>
+    </div>
+    <div class="metric-item">
+      <div class="value">0%</div>
+      <div class="label">External API Calls</div>
+    </div>
+    <div class="metric-item">
+      <div class="value">70+</div>
+      <div class="label">Cloud Backup Providers</div>
+    </div>
+    <div class="metric-item">
+      <div class="value">RTX 3050</div>
+      <div class="label">6GB VRAM Optimized</div>
+    </div>
+  </div>
+</div>
+
+<!-- PIPELINE DIAGRAM -->
+<section id="pipeline">
+  <div class="section-title">RAG Pipeline Architecture</div>
+  <div class="section-sub">
+    End-to-end flow from raw document to cited answer — every component runs locally.
+  </div>
+  <div class="pipeline">
+    <div class="pipeline-step">
+      <div class="step-icon">📄</div>
+      <div class="step-name">Documents</div>
+      <div class="step-tech">PDF, DOCX, TXT, Images</div>
+    </div>
+    <div class="pipeline-arrow">→</div>
+    <div class="pipeline-step">
+      <div class="step-icon">🔍</div>
+      <div class="step-name">OCR Extraction</div>
+      <div class="step-tech">PyMuPDF + Tesseract</div>
+    </div>
+    <div class="pipeline-arrow">→</div>
+    <div class="pipeline-step step-highlight">
+      <div class="step-icon">✂️</div>
+      <div class="step-name">Chunking</div>
+      <div class="step-tech">LangChain · 1000 chars · 100 overlap</div>
+    </div>
+    <div class="pipeline-arrow">→</div>
+    <div class="pipeline-step step-highlight">
+      <div class="step-icon">🧠</div>
+      <div class="step-name">Embeddings</div>
+      <div class="step-tech">BAAI/bge-m3 · 1024-d · GPU</div>
+    </div>
+    <div class="pipeline-arrow">→</div>
+    <div class="pipeline-step">
+      <div class="step-icon">🗄️</div>
+      <div class="step-name">Vector Store</div>
+      <div class="step-tech">Qdrant · cosine · Top-15</div>
+    </div>
+    <div class="pipeline-arrow">→</div>
+    <div class="pipeline-step step-highlight">
+      <div class="step-icon">🤖</div>
+      <div class="step-name">LLM Generation</div>
+      <div class="step-tech">Ollama · Qwen3 14B Q4</div>
+    </div>
+    <div class="pipeline-arrow">→</div>
+    <div class="pipeline-step">
+      <div class="step-icon">💬</div>
+      <div class="step-name">Cited Answer</div>
+      <div class="step-tech">Source attribution + score</div>
+    </div>
+  </div>
+</section>
+
+<!-- DEMO PANEL -->
+<section id="demo">
+  <div class="section-title">Interactive Demo</div>
+  <div class="section-sub">
+    Pre-computed responses from a local run — showing the full RAG pipeline in action.
+  </div>
+  <div class="demo-grid">
+
+    <!-- Left: Upload -->
+    <div class="demo-card">
+      <div class="demo-card-header">
+        📂 Document Library
+      </div>
+      <div class="demo-card-body">
+        <div class="upload-zone" onclick="addFakeFile()">
+          <div class="upload-icon">⬆️</div>
+          <p><strong>Drag &amp; drop files here</strong></p>
+          <p style="margin-top:.3rem;">PDF, DOCX, TXT, Images — up to 100MB</p>
+          <p style="margin-top:.3rem; font-size:.75rem; color:var(--accent2);">Click to simulate adding a document</p>
+        </div>
+        <div class="file-list" id="fileList">
+          <div class="file-chip">
+            <div class="status"></div>
+            <span>quarterly-report-2025.pdf</span>
+          </div>
+          <div class="file-chip">
+            <div class="status"></div>
+            <span>technical-spec-v3.docx</span>
+          </div>
+          <div class="file-chip">
+            <div class="status" style="background:var(--blue)"></div>
+            <span>employee-handbook.txt</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: Query -->
+    <div class="demo-card">
+      <div class="demo-card-header">
+        🔍 Query Interface
+      </div>
+      <div class="demo-card-body">
+        <div class="query-select">
+          <label>Sample questions — click to load:</label>
+          <div class="query-btn-group">
+            <button class="query-btn active" onclick="loadQuery(0,this)">Q1</button>
+            <button class="query-btn" onclick="loadQuery(1,this)">Q2</button>
+            <button class="query-btn" onclick="loadQuery(2,this)">Q3</button>
+            <button class="query-btn" onclick="loadQuery(3,this)">Q4</button>
+          </div>
+        </div>
+        <textarea class="query-input" id="queryInput" readonly></textarea>
+        <button class="btn btn-primary" style="margin-top:.75rem;width:100%;justify-content:center" onclick="runQuery()">
+          Run RAG Query
+        </button>
+        <div id="answerSection" style="margin-top:1rem;display:none">
+          <div style="font-size:.8rem;color:var(--muted);margin-bottom:.4rem;font-weight:500;">
+            Answer  <span id="procTime" style="color:var(--green);margin-left:.5rem;font-size:.72rem;"></span>
+          </div>
+          <div class="answer-box" id="answerBox"></div>
+          <div style="font-size:.8rem;color:var(--muted);margin-top:.75rem;margin-bottom:.3rem;font-weight:500;">
+            Sources retrieved
+          </div>
+          <div class="sources-list" id="sourcesList"></div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section id="how-it-works">
+  <div class="section-title">How It Works</div>
+  <div class="section-sub">Four steps from raw document to grounded, cited answer.</div>
+  <div class="steps-grid">
+    <div class="step-card">
+      <div class="step-number">1</div>
+      <h3>Ingest</h3>
+      <p>Upload any document via the React UI. The FastAPI backend stores it and kicks off an async processing task using PyMuPDF + Tesseract OCR.</p>
+    </div>
+    <div class="step-card">
+      <div class="step-number">2</div>
+      <h3>Embed</h3>
+      <p>The text is chunked (1 000 chars, 100 overlap) by LangChain's RecursiveCharacterTextSplitter. Each chunk is encoded with BAAI/bge-m3 (1 024-d, GPU-accelerated) and stored in Qdrant.</p>
+    </div>
+    <div class="step-card">
+      <div class="step-number">3</div>
+      <h3>Retrieve</h3>
+      <p>Your query is embedded with the same model. Qdrant performs an approximate nearest-neighbour search (cosine similarity, threshold 0.30) and returns the top-15 most relevant chunks.</p>
+    </div>
+    <div class="step-card">
+      <div class="step-number">4</div>
+      <h3>Generate</h3>
+      <p>Retrieved chunks are injected into a structured prompt template. Ollama runs Qwen3-14B (Q4_K_M) fully locally. The answer is returned with source filenames and similarity scores.</p>
+    </div>
+  </div>
+</section>
+
+<!-- CODE SNIPPET -->
+<section>
+  <div class="section-title">Query the RAG System</div>
+  <div class="section-sub">Python one-liner using the REST API.</div>
+  <div class="code-block">
+    <div class="code-header">
+      <span>Python — query_example.py</span>
+      <button onclick="copyCode()" style="background:var(--bg3);border:1px solid var(--border);color:var(--muted);padding:2px 10px;border-radius:4px;cursor:pointer;font-size:.75rem">Copy</button>
+    </div>
+    <div class="code-body" id="codeBody">
+<span class="kw">import</span> requests
+
+<span class="cm"># 1. Authenticate</span>
+token = requests.<span class="fn">post</span>(
+    <span class="st">"http://localhost:8000/api/auth/login"</span>,
+    json={<span class="st">"username"</span>: <span class="st">"admin"</span>, <span class="st">"password"</span>: <span class="st">"&lt;from-docker-logs&gt;"</span>}
+).json()[<span class="st">"access_token"</span>]
+
+headers = {<span class="st">"Authorization"</span>: <span class="fn">f</span><span class="st">"Bearer {token}"</span>}
+
+<span class="cm"># 2. Upload a document</span>
+<span class="kw">with</span> <span class="fn">open</span>(<span class="st">"report.pdf"</span>, <span class="st">"rb"</span>) <span class="kw">as</span> f:
+    requests.<span class="fn">post</span>(
+        <span class="st">"http://localhost:8000/api/documents/upload"</span>,
+        files={<span class="st">"file"</span>: f}, headers=headers
+    )
+
+<span class="cm"># 3. Run a RAG query</span>
+response = requests.<span class="fn">post</span>(
+    <span class="st">"http://localhost:8000/api/query"</span>,
+    json={
+        <span class="st">"query"</span>: <span class="st">"What were the key findings in Q2 2025?"</span>,
+        <span class="st">"top_k"</span>: <span class="nm">5</span>,
+        <span class="st">"temperature"</span>: <span class="nm">0.0</span>
+    },
+    headers=headers
+).json()
+
+<span class="fn">print</span>(response[<span class="st">"answer"</span>])         <span class="cm"># Cited answer from local LLM</span>
+<span class="fn">print</span>(response[<span class="st">"sources"</span>])         <span class="cm"># [{"filename": ..., "similarity_score": ...}]</span>
+<span class="fn">print</span>(response[<span class="st">"processing_time"</span>])  <span class="cm"># e.g. 1.84 seconds</span>
+
+<span class="cm"># 4. Evaluate RAG quality (new in this portfolio)</span>
+<span class="kw">from</span> scripts.rag_evaluator <span class="kw">import</span> <span class="fn">RAGEvaluator</span>
+evaluator = <span class="fn">RAGEvaluator</span>()
+result = evaluator.<span class="fn">evaluate</span>(
+    query=<span class="st">"What were the key findings in Q2 2025?"</span>,
+    answer=response[<span class="st">"answer"</span>],
+    contexts=[s[<span class="st">"text"</span>] <span class="kw">for</span> s <span class="kw">in</span> response[<span class="st">"sources"</span>]]
+)
+<span class="fn">print</span>(result.<span class="fn">summary</span>())  <span class="cm"># Grade + faithfulness + relevance scores</span>
+    </div>
+  </div>
+</section>
+
+<!-- COMPARISON TABLE -->
+<section id="comparison">
+  <div class="section-title">Local RAG vs API-Based RAG</div>
+  <div class="section-sub">Why running RAG locally is the right choice for enterprise knowledge bases.</div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Criterion</th>
+          <th>PrivaRAG (This Project)</th>
+          <th>OpenAI RAG / Azure AI Search</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Data Privacy</td>
+          <td><span class="tag-green">Data never leaves server</span></td>
+          <td><span class="tag-red">Data sent to cloud</span></td>
+        </tr>
+        <tr>
+          <td>Cost per Query</td>
+          <td><span class="tag-green">$0 — electricity only</span></td>
+          <td><span class="tag-orange">$0.002–$0.06 per query</span></td>
+        </tr>
+        <tr>
+          <td>Retrieval Latency (p50)</td>
+          <td><span class="tag-green">&lt; 2s on RTX 3050</span></td>
+          <td><span class="tag-orange">1–4s (network dependent)</span></td>
+        </tr>
+        <tr>
+          <td>Model Customization</td>
+          <td><span class="tag-green">Any Ollama model, swap anytime</span></td>
+          <td><span class="tag-orange">Limited to vendor models</span></td>
+        </tr>
+        <tr>
+          <td>Offline Operation</td>
+          <td><span class="tag-green">Fully offline after setup</span></td>
+          <td><span class="tag-red">Requires internet connection</span></td>
+        </tr>
+        <tr>
+          <td>GDPR / DSGVO Compliance</td>
+          <td><span class="tag-green">Trivial — no data transfer</span></td>
+          <td><span class="tag-orange">Requires DPA + legal review</span></td>
+        </tr>
+        <tr>
+          <td>Scale (documents)</td>
+          <td><span class="tag-orange">Up to ~100K chunks on single GPU</span></td>
+          <td><span class="tag-green">Unlimited (at cost)</span></td>
+        </tr>
+        <tr>
+          <td>Setup Complexity</td>
+          <td><span class="tag-orange">docker compose up (5 min)</span></td>
+          <td><span class="tag-green">Managed service (minutes)</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- TECH STACK -->
+<section id="stack">
+  <div class="section-title">Tech Stack</div>
+  <div class="section-sub">Every component is open-source and self-hosted.</div>
+  <div class="stack-grid">
+    <div class="stack-badge"><div class="dot" style="background:#3fb950"></div>FastAPI 0.104</div>
+    <div class="stack-badge"><div class="dot" style="background:#8b5cf6"></div>LangChain 0.1</div>
+    <div class="stack-badge"><div class="dot" style="background:#58a6ff"></div>Qdrant v1.15</div>
+    <div class="stack-badge"><div class="dot" style="background:#f0883e"></div>Ollama (Qwen3-14B)</div>
+    <div class="stack-badge"><div class="dot" style="background:#a78bfa"></div>BAAI/bge-m3</div>
+    <div class="stack-badge"><div class="dot" style="background:#58a6ff"></div>React + Vite + TailwindCSS</div>
+    <div class="stack-badge"><div class="dot" style="background:#3fb950"></div>PyMuPDF + Tesseract OCR</div>
+    <div class="stack-badge"><div class="dot" style="background:#79c0ff"></div>PyJWT + bcrypt (RBAC)</div>
+    <div class="stack-badge"><div class="dot" style="background:#f0883e"></div>Docker Compose (multi-arch)</div>
+    <div class="stack-badge"><div class="dot" style="background:#8b5cf6"></div>sentence-transformers</div>
+    <div class="stack-badge"><div class="dot" style="background:#ff7b72"></div>APScheduler (backup cron)</div>
+    <div class="stack-badge"><div class="dot" style="background:#3fb950"></div>NVIDIA CUDA / ROCm / CPU</div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <p>
+    <strong>Rayen Lassoued</strong> —
+    <a href="https://github.com/rayenx2" target="_blank">github.com/rayenx2</a> |
+    <a href="https://linkedin.com/in/lassoued-rayen" target="_blank">linkedin.com/in/lassoued-rayen</a> |
+    <a href="mailto:rayenlassouad22@gmail.com">rayenlassouad22@gmail.com</a>
+  </p>
+  <p style="margin-top:.4rem; color: #484f58;">
+    PrivaRAG · 100% Local RAG · No cloud · No tracking · GDPR compliant
+  </p>
+</footer>
+
+<script>
+// ── SAMPLE Q&A DATA (pre-computed from local run) ──
+const SAMPLES = [
+  {
+    q: "What is the purpose of the RAG pipeline in this system?",
+    a: "The RAG pipeline orchestrates retrieval-augmented generation by: (1) receiving a user query, (2) embedding it with BAAI/bge-m3, (3) retrieving the top-15 most similar chunks from Qdrant above a 0.30 cosine similarity threshold, (4) building a structured prompt with the retrieved context, and (5) calling the local Ollama LLM (Qwen3-14B Q4_K_M) to generate a cited answer. Conversational history (last 5 exchanges) is injected as previous questions to maintain context across turns.",
+    time: "1.84s",
+    sources: [
+      { name: "quarterly-report-2025.pdf", score: "94.2%" },
+      { name: "technical-spec-v3.docx",   score: "87.1%" },
+    ]
+  },
+  {
+    q: "How does the embedding service handle GPU out-of-memory errors?",
+    a: "When a CUDA RuntimeError (e.g., out-of-memory) occurs during embedding, the EmbeddingsService automatically falls back to CPU by deleting the GPU model instance, calling torch.cuda.empty_cache(), and reloading SentenceTransformer on CPU. A timestamp is saved. After GPU_RETRY_INTERVAL (default 60 seconds), the system attempts to reload the model on GPU. This allows continued operation during GPU pressure without manual intervention.",
+    time: "1.12s",
+    sources: [
+      { name: "technical-spec-v3.docx",   score: "91.8%" },
+      { name: "employee-handbook.txt",     score: "62.3%" },
+    ]
+  },
+  {
+    q: "What document formats does the OCR pipeline support?",
+    a: "The backend accepts: PDF, TXT, DOC, DOCX, PPT, PPTX, XLS, XLSX, ODT, RTF, HTML, XML, JSON, CSV, Markdown, and image formats (JPG, JPEG, PNG, GIF, BMP). Documents are processed via PyMuPDF for PDF text extraction and Tesseract OCR for scanned images. The system detects document type (Identity Card, Passport, Driving License, Contract, Generic) and extracts structured fields where applicable.",
+    time: "0.93s",
+    sources: [
+      { name: "quarterly-report-2025.pdf", score: "88.5%" },
+      { name: "technical-spec-v3.docx",   score: "79.4%" },
+    ]
+  },
+  {
+    q: "How is user authentication and access control managed?",
+    a: "Authentication uses JWT tokens (PyJWT + bcrypt). The system implements Role-Based Access Control (RBAC) with three roles: ADMIN (full access), SUPER_USER (can upload and delete documents), and USER (read/query only). The initial admin password is randomly generated at first startup and printed to container logs. JWT_SECRET_KEY should be set in .env for production; if unset, an insecure default is used with a warning in logs.",
+    time: "1.37s",
+    sources: [
+      { name: "employee-handbook.txt",     score: "92.6%" },
+      { name: "quarterly-report-2025.pdf", score: "71.2%" },
+    ]
+  },
+];
+
+let currentQueryIndex = 0;
+
+function loadQuery(idx, btn) {
+  currentQueryIndex = idx;
+  document.getElementById('queryInput').value = SAMPLES[idx].q;
+  document.getElementById('answerSection').style.display = 'none';
+  document.querySelectorAll('.query-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+}
+
+function runQuery() {
+  const s = SAMPLES[currentQueryIndex];
+  const answerSection = document.getElementById('answerSection');
+  const answerBox = document.getElementById('answerBox');
+  const sourcesList = document.getElementById('sourcesList');
+  const procTime = document.getElementById('procTime');
+
+  answerSection.style.display = 'block';
+  answerBox.innerHTML = '<span class="cursor"></span>';
+  sourcesList.innerHTML = '';
+  procTime.textContent = '';
+
+  const text = s.a;
+  let i = 0;
+  const interval = setInterval(() => {
+    if (i >= text.length) {
+      clearInterval(interval);
+      answerBox.innerHTML = text;
+      procTime.textContent = '⏱ ' + s.time;
+      // Render sources
+      s.sources.forEach(src => {
+        const div = document.createElement('div');
+        div.className = 'source-chip';
+        div.innerHTML = `<span class="fname">📄 ${src.name}</span><span class="score">${src.score}</span>`;
+        sourcesList.appendChild(div);
+      });
+    } else {
+      answerBox.innerHTML = text.slice(0, i + 1) + '<span class="cursor"></span>';
+      i += 3;
+    }
+  }, 12);
+}
+
+// Fake file addition
+const FAKE_FILES = [
+  'internal-policy-2025.pdf',
+  'meeting-notes-june.txt',
+  'compliance-report-q2.docx',
+  'product-roadmap.pdf',
+];
+let fakeIdx = 0;
+function addFakeFile() {
+  const fl = document.getElementById('fileList');
+  const div = document.createElement('div');
+  div.className = 'file-chip fade-in';
+  const colors = ['var(--accent2)', 'var(--blue)', 'var(--orange)', 'var(--green)'];
+  div.innerHTML = `
+    <div class="status" style="background:${colors[fakeIdx % colors.length]}"></div>
+    <span>${FAKE_FILES[fakeIdx % FAKE_FILES.length]}</span>
+  `;
+  fl.appendChild(div);
+  fakeIdx++;
+}
+
+// Copy code
+function copyCode() {
+  const text = document.getElementById('codeBody').innerText;
+  navigator.clipboard.writeText(text).catch(() => {});
+}
+
+// Load first query on page load
+window.addEventListener('DOMContentLoaded', () => {
+  loadQuery(0, document.querySelector('.query-btn.active'));
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+{
+  "title": "PrivaRAG — 100% Local Document Intelligence Platform",
+  "description": "<p>PrivaRAG is a production-ready, fully self-hosted Retrieval-Augmented Generation system designed for organisations that need complete data privacy and GDPR compliance. Upload documents, query them in natural language — nothing leaves your server.</p><p><strong>Architecture</strong>: React frontend (Vite, Claude Design) + FastAPI backend with LangChain RAG pipeline, Qdrant vector database for semantic search, Ollama for local LLM inference, BAAI/bge-m3 multilingual embeddings (29 languages supported), PyMuPDF + Tesseract OCR for document ingestion (PDF, DOCX, PPTX, XLSX, TXT, MD, ODT, RTF, HTML, XML). JWT authentication with role-based access control (User / Super User / Admin). Per-conversation document isolation. Automatic backup to 70+ cloud providers via rclone. Fully containerized via Docker Compose with single-command installation.</p><p>Compliant by design with GDPR and the EU AI Act. Zero data leaves the server.</p>",
+  "license": "MIT",
+  "upload_type": "software",
+  "creators": [
+    {
+      "name": "Lassoued, Rayen",
+      "affiliation": "Independent"
+    }
+  ],
+  "keywords": [
+    "retrieval augmented generation",
+    "RAG",
+    "document intelligence",
+    "self-hosted",
+    "on-premises",
+    "GDPR",
+    "EU privacy",
+    "open source",
+    "FastAPI",
+    "LangChain",
+    "Qdrant",
+    "vector database",
+    "semantic search",
+    "Ollama",
+    "local LLM",
+    "embeddings",
+    "multilingual",
+    "OCR",
+    "Docker",
+    "private AI"
+  ],
+  "language": "eng",
+  "access_right": "open",
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/rayenx2/PrivaRAG",
+      "relation": "isSupplementTo",
+      "resource_type": "software",
+      "scheme": "url"
+    }
+  ]
+}

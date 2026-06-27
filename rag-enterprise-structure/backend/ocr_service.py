@@ -1,0 +1,323 @@
+"""
+OCR Service - Smart PDF Detection + Tika/OCR Processing
+Automatically detects PDF type (text vs scanned) and routes appropriately.
+"""
+import logging
+import subprocess
+import requests
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+import re
+import os
+
+logger = logging.getLogger(__name__)
+
+
+def analyze_pdf(file_path: str) -> dict:
+    """
+    Analyze a PDF to determine if it's text-based or scanned.
+
+    Returns dict with:
+    - is_scanned: True if PDF appears to be scanned/image-based
+    - has_text: True if PDF has extractable text
+    - page_count: Number of pages
+    - text_ratio: Ratio of pages with text vs total pages
+    - sample_text: Sample of extracted text (first 500 chars)
+    """
+    try:
+        import fitz  # PyMuPDF
+
+        doc = fitz.open(file_path)
+        page_count = len(doc)
+        pages_with_text = 0
+        total_text = ""
+
+        # Check first 10 pages (or all if less)
+        pages_to_check = min(10, page_count)
+
+        for i in range(pages_to_check):
+            page = doc[i]
+            text = page.get_text().strip()
+            if len(text) > 50:  # Meaningful text (not just page numbers)
+                pages_with_text += 1
+                if len(total_text) < 1000:
+                    total_text += text + "\n"
+
+        doc.close()
+
+        text_ratio = pages_with_text / pages_to_check if pages_to_check > 0 else 0
+        is_scanned = text_ratio < 0.3  # Less than 30% of pages have text
+
+        result = {
+            "is_scanned": is_scanned,
+            "has_text": text_ratio > 0,
+            "page_count": page_count,
+            "text_ratio": text_ratio,
+            "sample_text": total_text[:500] if total_text else ""
+        }
+
+        logger.info(f"📊 PDF Analysis: {page_count} pages, text_ratio={text_ratio:.1%}, is_scanned={is_scanned}")
+        return result
+
+    except ImportError:
+        logger.warning("⚠️ PyMuPDF not installed, skipping PDF analysis")
+        return {"is_scanned": False, "has_text": True, "page_count": 0, "text_ratio": 1.0, "sample_text": ""}
+    except Exception as e:
+        logger.error(f"❌ PDF analysis failed: {e}")
+        return {"is_scanned": False, "has_text": True, "page_count": 0, "text_ratio": 1.0, "sample_text": ""}
+
+class OCRService:
+    TIKA_URL = "http://localhost:9998"
+    MIME_TYPES = {
+        '.pdf': 'application/pdf',
+        '.txt': 'text/plain',
+        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        '.doc': 'application/msword',
+        '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        '.ppt': 'application/vnd.ms-powerpoint',
+        '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        '.xls': 'application/vnd.ms-excel',
+        '.odt': 'application/vnd.oasis.opendocument.text',
+        '.rtf': 'application/rtf',
+        '.html': 'text/html',
+        '.htm': 'text/html',
+        '.xml': 'application/xml',
+        '.json': 'application/json',
+        '.csv': 'text/csv',
+        '.md': 'text/markdown',
+    }
+    
+    def __init__(self):
+        logger.info("Initializing OCR Service...")
+        self.tika_ready = False
+        self.tika_process = None
+        
+        self._aggressive_kill_tika()
+        self._start_tika()
+        logger.info("✅ OCR Service ready")
+    
+    def _aggressive_kill_tika(self):
+        try:
+            result1 = subprocess.run(['pkill', '-9', '-f', 'java.*tika'], 
+                         capture_output=True, timeout=5)
+            print(f"Kill java.*tika result: {result1.returncode}")
+        
+            result2 = subprocess.run(['pkill', '-9', '-f', '9998'], 
+                         capture_output=True, timeout=5)
+            print(f"Kill 9998 result: {result2.returncode}")
+        
+            time.sleep(2)
+        except Exception as e:
+            print(f"Kill error: {e}")
+    
+    def _start_tika(self):
+        logger.info("Starting Tika with 4GB heap...")
+        self.tika_process = subprocess.Popen(
+            ['java', '-Xmx4g', '-Xms1g', '-jar', '/opt/tika-server.jar', '-h', '0.0.0.0', '-p', '9998'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid
+        )
+        logger.info(f"Tika PID: {self.tika_process.pid}")
+        logger.info(f"Testing URL: {self.TIKA_URL}/version")
+        
+        logger.info("Waiting for Tika startup (60 sec)...")
+        for i in range(60):
+            try:
+                response = requests.get(f"{self.TIKA_URL}/version", timeout=1)
+                if response.status_code == 200:
+                    logger.info(f"✅ Tika ready at {i}s")
+                    self.tika_ready = True
+                    return
+            except Exception as e:
+                if i % 10 == 0:
+                    logger.warning(f"Attempt {i}/60 - {type(e).__name__}: {str(e)}")
+            time.sleep(1)
+        
+        logger.error(f"❌ Tika startup timeout! URL: {self.TIKA_URL}")
+        raise RuntimeError("Tika not available")
+    
+    def _get_mime_type(self, file_path: str) -> str:
+        ext = Path(file_path).suffix.lower()
+        return self.MIME_TYPES.get(ext, 'application/octet-stream')
+
+    def _ensure_tika_healthy(self):
+        """Check if Tika is responding, restart if not"""
+        try:
+            response = requests.get(f"{self.TIKA_URL}/version", timeout=5)
+            if response.status_code == 200:
+                return True
+        except Exception as e:
+            logger.warning(f"⚠️ Tika health check failed: {e}")
+
+        # Tika is not responding, restart it
+        logger.warning("🔄 Restarting Tika server...")
+        self._aggressive_kill_tika()
+        self._start_tika()
+        return self.tika_ready
+
+    def extract_text(self, file_path: str) -> str:
+        try:
+            logger.info(f"Extracting: {Path(file_path).name}")
+            ext = Path(file_path).suffix.lower()
+
+            # 1. Plain text files - read directly
+            if ext in ['.txt', '.md', '.csv']:
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        text = f.read()
+                    if text and len(text.strip()) > 0:
+                        logger.info(f"✅ {len(text)} chars (direct)")
+                        return text.strip()
+                except Exception as e:
+                    logger.warning(f"Direct read failed: {str(e)}")
+
+            # 2. For PDFs: Analyze and route appropriately
+            if ext == '.pdf':
+                pdf_info = analyze_pdf(file_path)
+
+                # TEXT PDFs: Try PyMuPDF first - it's fast and handles text PDFs well
+                # SCANNED PDFs: Fall through to Tika (which uses Tesseract internally)
+                if pdf_info["has_text"] and pdf_info["text_ratio"] > 0.5:
+                    logger.info(f"📄 Trying PyMuPDF extraction (text_ratio={pdf_info['text_ratio']:.1%})...")
+                    try:
+                        import fitz
+                        doc = fitz.open(file_path)
+                        full_text = ""
+                        for page in doc:
+                            full_text += page.get_text() + "\n"
+                        doc.close()
+                        if full_text and len(full_text.strip()) > 500:
+                            logger.info(f"✅ {len(full_text)} chars (PyMuPDF)")
+                            return full_text.strip()
+                        else:
+                            logger.info(f"PyMuPDF got only {len(full_text)} chars, trying Tika...")
+                    except Exception as e:
+                        logger.warning(f"PyMuPDF failed: {e}, trying Tika...")
+
+            # 3. Ensure Tika is healthy
+            self._ensure_tika_healthy()
+            logger.info(f"Tika ready: {self.tika_ready}")
+            
+            if self.tika_ready:
+                try:
+                    logger.info(f"Opening file: {file_path}")
+                    with open(file_path, 'rb') as f:
+                        file_data = f.read()
+                    logger.info(f"File size: {len(file_data)} bytes ({len(file_data)/1024/1024:.1f}MB)")
+
+                    mime_type = self._get_mime_type(file_path)
+                    logger.info(f"MIME type: {mime_type}")
+                    logger.info(f"Sending to Tika: {self.TIKA_URL}/tika (timeout: 600s)")
+
+                    # Timeout 600s (10 min) - Tika with internal OCR needs time for scanned PDFs
+                    response = requests.put(
+                        f"{self.TIKA_URL}/tika",
+                        data=file_data,
+                        headers={
+                            'Content-Type': mime_type,
+                            'Accept-Charset': 'utf-8'
+                        },
+                        timeout=600
+                    )
+
+                    # Forza encoding UTF-8 sulla risposta
+                    response.encoding = 'utf-8'
+
+                    logger.info(f"Tika response status: {response.status_code}")
+                    logger.info(f"Tika response encoding: {response.encoding}")
+                    logger.info(f"Tika response length: {len(response.text)} chars")
+                    
+                    if response.status_code == 200:
+                        text = self._extract_text_from_tika_xml(response.text)
+                        if text and len(text.strip()) > 100:
+                            logger.info(f"✅ {len(text)} chars (Tika)")
+                            return text
+                except requests.exceptions.Timeout:
+                    logger.error(f"⏱️ Tika timeout after 600s - file may be too large/complex")
+                    logger.warning("Falling back to Tesseract...")
+                except requests.exceptions.ConnectionError as e:
+                    logger.error(f"🔌 Tika connection error: {e}")
+                    logger.warning("🔄 Restarting Tika...")
+                    self._aggressive_kill_tika()
+                    self._start_tika()
+                except Exception as e:
+                    logger.error(f"Tika request error: {type(e).__name__}: {str(e)}")
+
+            # 🔧 FALLBACK TO TESSERACT if Tika didn't extract enough
+            logger.warning("⚠️  Tika extraction insufficient, trying Tesseract...")
+            tesseract_text = self._extract_with_tesseract(file_path)
+            if tesseract_text and len(tesseract_text.strip()) > 0:
+                logger.info(f"✅ {len(tesseract_text)} chars (Tesseract fallback)")
+                return tesseract_text
+
+            logger.warning("⚠️  No extraction worked")
+            return ""
+        except Exception as e:
+            logger.error(f"Extract error: {str(e)}")
+            return ""
+    
+    def _extract_text_from_tika_xml(self, xml_text: str) -> str:
+        try:
+            logger.info(f"XML length: {len(xml_text)} chars")
+            
+            if xml_text.startswith('\ufeff'):
+                xml_text = xml_text[1:]
+            
+            xml_text = re.sub(r'&#0;', '', xml_text)
+            xml_text = re.sub(r'&#[0-9]+;', '', xml_text)
+            
+            root = ET.fromstring(xml_text)
+            logger.info(f"XML parsed successfully")
+            
+            ns = {'xhtml': 'http://www.w3.org/1999/xhtml'}
+            
+            body = root.find('.//xhtml:body', ns)
+            if body is not None:
+                text = ''.join(body.itertext()).strip()
+                logger.info(f"Found xhtml:body with {len(text)} chars")
+                if text:
+                    return text
+            
+            body = root.find('.//body')
+            if body is not None:
+                text = ''.join(body.itertext()).strip()
+                logger.info(f"Found body with {len(text)} chars")
+                if text:
+                    return text
+            
+            text = ''.join(root.itertext()).strip()
+            logger.info(f"Got all text: {len(text)} chars")
+            return text if text else ""
+            
+        except Exception as e:
+            logger.error(f"XML error: {type(e).__name__}: {str(e)}")
+            return ""
+    
+    def _extract_with_tesseract(self, file_path: str) -> str:
+        """Fallback: extract text using Tesseract directly"""
+        try:
+            import pytesseract
+            from pdf2image import convert_from_path
+
+            logger.info(f"🔍 Tesseract: converting PDF to images...")
+            images = convert_from_path(file_path)
+            logger.info(f"📄 {len(images)} pages converted")
+
+            text = ""
+            for i, img in enumerate(images):
+                logger.info(f"  OCR page {i+1}/{len(images)}...")
+                page_text = pytesseract.image_to_string(img, lang='ita+eng')
+                text += page_text + "\n"
+
+            logger.info(f"✅ Tesseract extracted {len(text)} chars")
+            logger.info(f"📋 TESSERACT TEXT:\n{text[:1000]}")
+            return text
+
+        except ImportError as e:
+            logger.error(f"❌ Missing module: {e}")
+            return ""
+        except Exception as e:
+            logger.error(f"❌ Tesseract failed: {type(e).__name__}: {str(e)}")
+            return ""
